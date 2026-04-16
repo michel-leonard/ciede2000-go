@@ -1,0 +1,97 @@
+name: Go CIEDE2000 Testing
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+
+jobs:
+  test-implementation-de00-go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v6
+
+      - name: 📦 Set up Go
+        run: |
+          command -v go > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes go ; }
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: ⚙️ Compile Go file
+        run: |
+          printf '%s\n' '' \
+          'package main' \
+          '' \
+          'import (' \
+          '	"bufio"' \
+          '	"fmt"' \
+          '	"math"' \
+          '	"os"' \
+          '	"strconv"' \
+          '	"strings"' \
+          ')' \
+          '' > ciede2000-driver.go
+          tail -n +7 ciede2000.go >> ciede2000-driver.go
+          printf '%s\n' '' \
+          'func main() {' \
+          '	canonical := 2 < len(os.Args)' \
+          '	filename := os.Args[1]' \
+          '	file, _ := os.Open(filename)' \
+          '	defer file.Close()' \
+          '	scanner := bufio.NewScanner(file)' \
+          '	for scanner.Scan() {' \
+          '		line := scanner.Text()' \
+          '		fields := strings.Split(line, ",")' \
+          '		if len(fields) == 9 {' \
+          '			l1, _ := strconv.ParseFloat(fields[0], 64)' \
+          '			a1, _ := strconv.ParseFloat(fields[1], 64)' \
+          '			b1, _ := strconv.ParseFloat(fields[2], 64)' \
+          '			l2, _ := strconv.ParseFloat(fields[3], 64)' \
+          '			a2, _ := strconv.ParseFloat(fields[4], 64)' \
+          '			b2, _ := strconv.ParseFloat(fields[5], 64)' \
+          '			kl, _ := strconv.ParseFloat(fields[6], 64)' \
+          '			kc, _ := strconv.ParseFloat(fields[7], 64)' \
+          '			kh, _ := strconv.ParseFloat(fields[8], 64)' \
+          '			delta := ciede2000_with_parameters(l1, a1, b1, l2 ,a2, b2, kl, kc, kh, canonical)' \
+          '			fmt.Printf("%s,%.14f\n", line, delta)' \
+          '		}' \
+          '	}' \
+          '}' \
+          '' >> ciede2000-driver.go
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: gcc --version && gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: 🚀 Run test cases in Go and stream to verifier
+        run: |
+          go run ciede2000-driver.go test-cases.csv --canonical | ./ciede2000-native -o summary-canonical.txt &
+          go run ciede2000-driver.go test-cases.csv | ./ciede2000-native -o summary-simplified.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
